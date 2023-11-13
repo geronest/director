@@ -13,6 +13,8 @@ class Gym(embodied.Env):
     self._act_key = act_key
     self._done = True
     self._info = None
+    self._obs_dict = None
+    self._act_dict = None
 
   @property
   def info(self):

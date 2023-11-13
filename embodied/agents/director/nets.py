@@ -320,9 +320,24 @@ class MLP(tfutils.Module):
     self._layers = layers
     self._units = units
     self._inputs = Input(inputs, dims=dims)
-    distkeys = ('dist', 'outscale', 'minstd', 'maxstd', 'unimix', 'outnorm')
-    self._dense = {k: v for k, v in kw.items() if k not in distkeys}
-    self._dist = {k: v for k, v in kw.items() if k in distkeys}
+    addkeys = (
+      'dist', 
+      'outscale', 
+      'minstd', 
+      'maxstd', 
+      'unimix', 
+      'outnorm',
+      'enn_zdim',
+      'enn_zdist',
+      'enn_layers',
+    )
+    # distkeys = ('dist', 'outscale', 'minstd', 'maxstd', 'unimix', 'outnorm')
+    self._dense = {k: v for k, v in kw.items() if k not in addkeys}
+    self._dist = {k: v for k, v in kw.items() if (k in addkeys and 'enn' not in k)}
+    self._enn = {k: v for k, v in kw.items() if (k in addkeys and 'enn' in k)}
+    self._use_enn = len(self._enn.keys()) > 0
+    if self._use_enn:
+      print("USING ENN!")
 
   def __call__(self, inputs):
     feat = self._inputs(inputs)
@@ -330,18 +345,36 @@ class MLP(tfutils.Module):
     x = x.reshape([-1, x.shape[-1]])
     for i in range(self._layers):
       x = self.get(f'dense{i}', Dense, self._units, **self._dense)(x)
+    if self._use_enn:
+      zdist = tfd.Normal(0, 1)
+      z = zdist.sample(self._enn["enn_zdim"])
+      x_p = x
+      x_l = x
+      for i in range(self._enn["enn_layers"]):
+        x_p = self.get(f'enn_p_dense{i}', Dense, self._units, **self._dense)(x_p)
+        x_l = self.get(f'enn_l_dense{i}', Dense, self._units, **self._dense)(x_l)
     x = x.reshape(feat.shape[:-1] + [x.shape[-1]])
     if self._shape is None:
       return x
     elif isinstance(self._shape, tuple):
-      return self._out('out', self._shape, x)
+      x_enn = None
+      if self._use_enn:
+        dim_out = np.prod(self._shape).astype(np.int32)
+        dim_enn_out = dim_out * self._enn["enn_zdim"]
+        x_p = self.get(f'enn_p_out', Dense, dim_enn_out, **self._dense)(x_p)
+        x_l = self.get(f'enn_l_out', Dense, dim_enn_out, **self._dense)(x_l)
+        x_p = tf.reduce_sum(x_p * z, axis=-1)
+        x_l = tf.reduce_sum(x_l * z, axis=-1)
+        x_enn = tf.stop_gradient(x_p) + x_l
+        x_enn = x_enn.reshape(feat.shape[:-1] + [dim_out])
+      return self._out('out', self._shape, x, x_enn)
     elif isinstance(self._shape, dict):
       return {k: self._out(k, v, x) for k, v in self._shape.items()}
     else:
       raise ValueError(self._shape)
 
-  def _out(self, name, shape, x):
-    return self.get(f'dist_{name}', DistLayer, shape, **self._dist)(x)
+  def _out(self, name, shape, x, addout = None):
+    return self.get(f'dist_{name}', DistLayer, shape, **self._dist)(x, addout)
 
 
 class DistLayer(tfutils.Module):
@@ -357,13 +390,13 @@ class DistLayer(tfutils.Module):
     self._outscale = outscale
     self._unimix = unimix
 
-  def __call__(self, inputs):
-    dist = self.inner(inputs)
+  def __call__(self, inputs, addout = None):
+    dist = self.inner(inputs, addout)
     assert tuple(dist.batch_shape) == tuple(inputs.shape[:-1]), (
         dist.batch_shape, dist.event_shape, inputs.shape)
     return dist
 
-  def inner(self, inputs):
+  def inner(self, inputs, addout = None):
     kw = {}
     if self._outscale == 0.0:
       kw['kernel_initializer'] = tfki.Zeros()
@@ -371,6 +404,8 @@ class DistLayer(tfutils.Module):
       kw['kernel_initializer'] = tfki.VarianceScaling(
           self._outscale, 'fan_avg', 'uniform')
     out = self.get('out', tfkl.Dense, np.prod(self._shape), **kw)(inputs)
+    if addout is not None:
+      out = out + addout
     out = tf.reshape(out, tuple(inputs.shape[:-1]) + self._shape)
     out = tf.cast(out, tf.float32)
     if self._dist in ('normal', 'trunc_normal', 'dir'):
